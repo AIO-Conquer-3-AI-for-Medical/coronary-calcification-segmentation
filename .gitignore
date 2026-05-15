@@ -1,32 +1,4 @@
-# --- Data ---
-app/temp_storage/
-*.zip
-*.7z
-*.dcm
-*.npy
-
-data/
-*.zip
-*.7z
-*.dcm
-*.npy
-
-# --- Models ---
-models/weights/*.pt
-models/weights/*.pth
-models/weights/*.h5
-models/weights/*.onnx
-
-# --- Python & Env ---
-__pycache__/
-*.pyc
-venv/
-.venv/
-env/
-.env
-
-# --- OS & IDE ---
-.vscode/
-.idea/
-.DS_Store
-*.log
+/Gated_release_final
+/dataprep
+/deidentified_nongated
+/*.docx
