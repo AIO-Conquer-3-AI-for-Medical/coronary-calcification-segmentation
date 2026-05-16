@@ -2,3 +2,6 @@
 /dataprep
 /deidentified_nongated
 /*.docx
+/Residual&Dilated.ipynb
+/checkpoints
+/splitting.py
