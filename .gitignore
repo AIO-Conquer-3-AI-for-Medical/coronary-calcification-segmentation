@@ -2,6 +2,9 @@
 /dataprep
 /deidentified_nongated
 /*.docx
-/Residual&Dilated.ipynb
-/checkpoints
 /splitting.py
+/models/checkpoints/best_checkpoint.pt
+/models/checkpoints/latest_checkpoint.pt
+/models/checkpoints_context/best_checkpoint.pt
+/models/checkpoints_context/latest_checkpoint.pt
+.env
