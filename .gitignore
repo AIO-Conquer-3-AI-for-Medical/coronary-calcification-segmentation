@@ -1,5 +1,4 @@
 /Gated_release_final
-/dataprep
 /deidentified_nongated
 /*.docx
 /splitting.py
@@ -15,4 +14,5 @@
 /data/Gated_release_final/processed_data/processing_manifest.csv
 /data/Gated_release_final/processed_data/xml_roi_audit.csv
 
-/dataprep/agatston_results
+/dataprep/data_processing.py
+/dataprep/pre_processing.py
