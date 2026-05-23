@@ -8,3 +8,11 @@
 /models/checkpoints_context/best_checkpoint.pt
 /models/checkpoints_context/latest_checkpoint.pt
 .env
+/data/Gated_release_final/calcium_xml
+/data/Gated_release_final/patient
+/data/Gated_release_final/processed_data/images
+/data/Gated_release_final/processed_data/masks
+/data/Gated_release_final/processed_data/processing_manifest.csv
+/data/Gated_release_final/processed_data/xml_roi_audit.csv
+
+/dataprep/agatston_results
