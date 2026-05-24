@@ -14,6 +14,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import pydicom
+import os
+import sys
+import shutil
+from pathlib import Path
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 # Import core processing logic
 from src.pre_processing import extract_zip_dicom
@@ -26,6 +31,16 @@ from src.agatston_score import calculate_agatston_for_volume
 # Define temporary storage and model weight paths
 TEMP_STORAGE_DIR = root_path / "app" / "temp_storage"
 WEIGHT_PATH = root_path / "models" / "weights" / "best_model.pt"
+
+BASE_TEMP_DIR = root_path / "app" / "temp_storage"
+BASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Đảm bảo thư mục temp_storage luôn tồn tại trên server khi deploy
+TEMP_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+ctx = get_script_run_ctx()
+session_id = ctx.session_id if ctx else "default_session"
+USER_TEMP_DIR = BASE_TEMP_DIR / session_id
 
 # Initialize U-Net Model
 @st.cache_resource
@@ -62,6 +77,22 @@ with st.sidebar:
 # --- STATE MANAGEMENT ---
 if "current_file_name" not in st.session_state:
     st.session_state["current_file_name"] = None
+
+if "current_file_name" not in st.session_state:
+    st.session_state["current_file_name"] = None
+
+if uploaded_file is not None and st.session_state["current_file_name"] != uploaded_file.name:
+    st.session_state["processed"] = False
+    st.session_state["current_file_name"] = uploaded_file.name
+    # Khi đổi sang file bệnh nhân mới, tiến hành xóa sạch kho lưu trữ cũ của chính phiên đó
+    if USER_TEMP_DIR.exists():
+        shutil.rmtree(USER_TEMP_DIR)
+        
+elif uploaded_file is None:
+    st.session_state["processed"] = False
+    st.session_state["current_file_name"] = None
+    if USER_TEMP_DIR.exists():
+        shutil.rmtree(USER_TEMP_DIR)    
 
 if uploaded_file is not None and st.session_state["current_file_name"] != uploaded_file.name:
     st.session_state["processed"] = False
