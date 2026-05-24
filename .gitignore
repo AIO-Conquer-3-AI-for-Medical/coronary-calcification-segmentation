@@ -12,7 +12,7 @@ data/
 *.npy
 
 # --- Models ---
-models/weights/*.pt
+# models/weights/*.pt
 models/weights/*.pth
 models/weights/*.h5
 models/weights/*.onnx
