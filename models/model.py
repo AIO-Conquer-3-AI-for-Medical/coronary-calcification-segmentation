@@ -71,29 +71,62 @@ class UNetModel(nn.Module):
 
     def predict_volume(self, images_25d_stack, hu_volume, device, threshold=0.5):
         """
-        Khởi chạy vòng lặp Inference cho toàn bộ các lát cắt của ca bệnh.
+        Thực hiện inference (dự đoán) và đóng gói cấu trúc đầu ra đồng bộ 100% 
+        giữa mặt nạ phân đoạn và logic trích xuất tỷ trọng lâm sàng.
         
         Tham số:
         ----------
         images_25d_stack : np.ndarray
-            Mảng dữ liệu đầu vào đã chuẩn hóa và bọc khối 2.5D, shape: [D, 3, 512, 512]
+            Mảng khối đầu vào 2.5D đã được chuẩn hóa, shape: [D, 3, 512, 512]
         hu_volume : np.ndarray
-            Mảng dữ liệu ảnh CT ở đơn vị HU gốc, shape: [D, 512, 512]
+            Khối mảng giá trị Hounsfield Unit thô gốc (chưa scale), shape: [D, 512, 512]
+        device : str hoặc torch.device
+            Thiết bị xử lý tính toán ('cuda' hoặc 'cpu')
+        threshold : float
+            Ngưỡng nhị phân hóa lâm sàng (nhận động từ thanh trượt score_threshold trên UI)
         """
+        import pandas as pd
+        
         self.eval()
         pred_mask_volume = []
+        slice_records = []
+        
+        D, H, W = hu_volume.shape
         
         with torch.no_grad():
             for i in range(images_25d_stack.shape[0]):
-                # Trích xuất lát cắt 2.5D hiện tại và đẩy lên thiết bị tính toán (GPU/CPU)
-                slice_tensor = torch.from_numpy(images_25d_stack[i]).unsqueeze(0).float().to(device) # [1, 3, 512, 512]
+                # 1. Lan truyền tiến (Forward pass) qua mạng U-Net
+                slice_tensor = torch.from_numpy(images_25d_stack[i]).unsqueeze(0).float().to(device)
+                logits = self(slice_tensor)
                 
-                # Forward qua mạng U-Net
-                logits = self.forward(slice_tensor)
-                probs = torch.sigmoid(logits).cpu().numpy()[0, 0] # Lấy ma trận xác suất 2D [512, 512]
+                # 2. Tính toán bản đồ xác suất qua hàm Sigmoid giống hệt file .ipynb
+                probs = torch.sigmoid(logits).cpu().numpy()[0, 0]
                 
-                # Áp ngưỡng tạo mặt nạ phân vùng nhị phân
+                # 3. ĐỒNG BỘ NGƯỠNG: Tạo mặt nạ nhị phân duy nhất dựa trên tham số truyền vào
                 binary_mask = (probs >= threshold).astype(np.uint8)
                 pred_mask_volume.append(binary_mask)
                 
-        return np.array(pred_mask_volume), hu_volume
+                # 4. Trích xuất thông tin dựa trên CHÍNH mặt nạ nhị phân đã đồng bộ ngưỡng
+                if np.any(binary_mask > 0):
+                    hu_slice = hu_volume[i]
+                    
+                    # Tìm đậm độ lớn nhất (Max HU) TRONG VÙNG MÔ HÌNH DỰ ĐOÁN ĐƯỢC (đã áp threshold)
+                    max_hu = np.max(hu_slice[binary_mask > 0])
+                    
+                    # Tiêu chuẩn lọc tỷ trọng lâm sàng tối thiểu
+                    if max_hu >= 130.0:
+                        slice_records.append({
+                            "slice_idx": i,
+                            "max_hu": round(float(max_hu), 1)
+                        })
+                        
+        # Gộp kết quả thành mảng Numpy 3D dạng [D, 512, 512]
+        pred_mask_volume_np = np.array(pred_mask_volume, dtype=np.uint8)
+        
+        # Tạo DataFrame đầu ra đảm bảo cấu trúc dữ liệu luôn nhất quán
+        if slice_records:
+            slice_records_df = pd.DataFrame(slice_records)
+        else:
+            slice_records_df = pd.DataFrame(columns=["slice_idx", "max_hu"])
+            
+        return pred_mask_volume_np, slice_records_df
