@@ -24,6 +24,17 @@ WEIGHT_PATH = root_path / "models" / "weights" / "best_model.pt"
 BASE_TEMP_DIR = root_path / "app" / "temp_storage"
 BASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Hậu xử lý khởi động: Xóa sạch các thư mục rác tồn đọng từ các lần chạy app trước đó
+@st.cache_resource
+def clean_all_legacy_temp_storage():
+    if BASE_TEMP_DIR.exists():
+        import shutil
+        shutil.rmtree(BASE_TEMP_DIR, ignore_errors=True)
+    BASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Chạy hàm dọn dẹp hệ thống một lần duy nhất khi khởi động ứng dụng
+clean_all_legacy_temp_storage()
+
 # Initialize independent session storage to prevent cross-session IO conflicts
 if "session_id" not in st.session_state:
     import uuid
@@ -306,6 +317,9 @@ if uploaded_zip is not None and st.session_state["run_analysis"]:
 
             plt.tight_layout()
             st.pyplot(fig)
+
+            plt.close(fig)
+            del fig, axes
 
             # Detailed Logs Viewers
             st.markdown("#### 📝 Diagnostic Logs Checklist")

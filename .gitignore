@@ -1,9 +1,6 @@
 # --- Data ---
 app/temp_storage/
-*.zip
-*.7z
-*.dcm
-*.npy
+
 
 data/
 *.zip
