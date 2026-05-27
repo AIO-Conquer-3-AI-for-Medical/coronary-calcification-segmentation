@@ -18,7 +18,7 @@ import cv2
 from src.pre_processing import extract_zip_dicom
 from src.data_processing import COCATransformer
 from models.model import UNetModel
-from src.agatston_score import calculate_agatston_score, xml_plist_to_mask_volume
+from src.agatston_score import calculate_agatston_score, xml_plist_to_mask_volume, get_scoring_mask
 
 WEIGHT_PATH = root_path / "models" / "weights" / "best_model.pt"
 BASE_TEMP_DIR = root_path / "app" / "temp_storage"
@@ -269,8 +269,7 @@ if uploaded_zip is not None and st.session_state["run_analysis"]:
             mask_gt = gt_mask_volume[selected_slice] if gt_available else None
 
             # Configure windowing (soft tissue/bone) to optimize contrast for coronary CT images
-            vmin = -200
-            max = 600
+            vmin, vmax = -200, 600
             img_clipped = np.clip(img_slice, vmin, vmax)
 
             fig, axes = plt.subplots(1, 3, figsize=(18, 5))

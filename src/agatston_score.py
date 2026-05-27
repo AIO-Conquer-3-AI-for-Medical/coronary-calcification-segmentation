@@ -124,7 +124,7 @@ def calculate_agatston_score(mask_volume, hu_volume, pixel_spacing):
             
             # TIÊU CHUẨN LÂM SÀNG 2: Diện tích thực tế của cụm tổn thương phải >= 1 mm²
             cluster_area_mm2 = num_pixels * pixel_area_mm2
-            if cluster_area_mm2 < 1.0:
+            if cluster_area_mm2 < 0.5:
                 continue
                 
             # Tìm đậm độ lớn nhất (Max HU) bên trong cụm để gán trọng số mật độ nguy cơ (Weight Factor)
