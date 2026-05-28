@@ -6,93 +6,71 @@ import pydicom
 
 class COCATransformer:
     def __init__(self, window_center=400, window_width=1200):
-        """
-        Khởi tạo bộ chuyển đổi dữ liệu chuỗi ảnh DICOM sang khối ảnh giải phẫu 2.5D.
-        
-        Các tham số window_center và window_width mặc định được thiết lập tương ứng với 
-        dải Hounsfield Unit thấp nhất là -200.0 và cao nhất là 1000.0 HU.
-        """
         self.wc = window_center
         self.ww = window_width
-        # Đồng bộ hóa chính xác dải chặn (clipping margins) từ file huấn luyện gốc
+        # Đồng bộ chính xác dải chặn từ file huấn luyện gốc trong Notebook
         self.hu_low = -200.0
         self.hu_high = 1000.0
 
     def load_and_sort_dicom_folder(self, folder_path):
         """
-        Quét thư mục chứa chuỗi ảnh DICOM, sắp xếp theo tọa độ trục Z thực tế.
-        Trả về danh sách đường dẫn file đã được sắp xếp và thông số pixel spacing.
+        Quét toàn bộ thư mục DICOM, lọc các file hợp lệ và 
+        sắp xếp nghiêm ngặt theo tọa độ Z giải phẫu tăng dần.
         """
         folder = Path(folder_path)
         slices_meta = []
-        pixel_spacing = None
 
         for file_path in folder.rglob("*"):
             if file_path.is_file():
                 try:
-                    # Đọc lướt qua header để lấy thông tin hình học giải phẫu trục Z
-                    ds = pydicom.dcmread(str(file_path), stop_before_pixels=True)
-                    if "ImagePositionPatient" in ds:
-                        z_pos = float(ds.ImagePositionPatient[2])
-                        slices_meta.append((z_pos, file_path))
-                        if pixel_spacing is None and "PixelSpacing" in ds:
-                            pixel_spacing = [float(x) for x in ds.PixelSpacing]
+                    ds = pydicom.dcmread(str(file_path))
+                    if hasattr(ds, "pixel_array") and hasattr(ds, "ImagePositionPatient"):
+                        slices_meta.append(ds)
                 except Exception:
                     continue
 
         if not slices_meta:
-            return [], None
+            raise RuntimeError(f"Thư mục {folder_path} không chứa dữ liệu DICOM hợp lệ.")
 
-        # Sắp xếp chuỗi ảnh tăng dần dựa trên tọa độ hình học thực tế ImagePositionPatient[2]
-        slices_meta.sort(key=lambda x: x[0])
-        sorted_paths = [item[1] for item in slices_meta]
+        # SỬA LỖI LỆCH TRỤC Z: Sắp xếp lát cắt theo tọa độ hình học Z tăng dần
+        slices_meta.sort(key=lambda x: float(x.ImagePositionPatient[2]))
         
-        return sorted_paths, pixel_spacing
+        # Lấy thông số kích thước pixel thực tế (phục vụ tính diện tích mm^2)
+        pixel_spacing = slices_meta[0].PixelSpacing if hasattr(slices_meta[0], "PixelSpacing") else [0.5, 0.5]
+        
+        return slices_meta, pixel_spacing
 
-    def prepare_25d_volume(self, sorted_paths):
+    def transform_patient_volume(self, sorted_slices):
         """
-        Trích xuất giá trị Hounsfield Unit (HU), thực hiện chuẩn hóa dải tuyến tính 
-        và xếp chồng các lát cắt thành các khối 2.5D (3 kênh đầu vào).
-        
-        Tuân thủ cấu trúc phân phối của dataclean.ipynb:
-        - Kênh 0: Lát cắt hiện tại (Target slice 'k')
-        - Kênh 1: Lát cắt phía trước (Context slice 'k-1')
-        - Kênh 2: Lát cắt phía sau (Context slice 'k+1')
+        Chuyển đổi chuỗi ảnh DICOM đã sắp xếp thành mảng HU thô và khối 2.5D bọc kênh.
         """
         slices_hu = []
-
-        # Đọc dữ liệu pixel thô và quy đổi sang đơn vị chuẩn HU định lượng y tế
-        for path in sorted_paths:
-            try:
-                ds = pydicom.dcmread(str(path))
-                intercept = float(ds.RescaleIntercept) if "RescaleIntercept" in ds else 0.0
-                slope = float(ds.RescaleSlope) if "RescaleSlope" in ds else 1.0
-                hu_array = ds.pixel_array.astype(np.float32) * slope + intercept
-                slices_hu.append(hu_array)
-            except Exception:
-                continue
+        for ds in sorted_slices:
+            intercept = float(ds.RescaleIntercept) if "RescaleIntercept" in ds else 0.0
+            slope = float(ds.RescaleSlope) if "RescaleSlope" in ds else 1.0
+            hu_array = ds.pixel_array.astype(np.float32) * slope + intercept
+            slices_hu.append(hu_array)
 
         hu_volume = np.array(slices_hu, dtype=np.float32)
         D, H, W = hu_volume.shape
 
-        # Tiến hành ép dải chặn và chuẩn hóa Min-Max tuyến tính về đoạn [0.0, 1.0]
+        # Tiến hành ép dải chặn (clipping) và chuẩn hóa tuyến tính giống Notebook huấn luyện
         images_normalized = np.clip(hu_volume, self.hu_low, self.hu_high)
         images_normalized = (images_normalized - self.hu_low) / (self.hu_high - self.hu_low)
 
-        # Cấu trúc hóa các khối ảnh trượt 2.5D
+        # SỬA LỖI KÊNH 2.5D: Sắp xếp chuẩn khít [Kênh 0: Trước, Kênh 1: Hiện tại, Kênh 2: Sau]
         volume_25d = []
         for k in range(D):
-            # Xử lý lặp biên giải phẫu an toàn (Replicate boundary padding) nếu chạm đỉnh/đáy khối ảnh
             idx_prev = max(0, k - 1)
             idx_next = min(D - 1, k + 1)
-
-            # Khớp chính xác 100% thứ tự các trục kênh giải phẫu giống hệt khâu Huấn luyện
-            stack = np.stack([
-                images_normalized[k],         # Kênh 0: Lát cắt hiện tại cần phân đoạn (Target)
-                images_normalized[idx_prev],  # Kênh 1: Ngữ cảnh lát cắt liền trước (Context)
-                images_normalized[idx_next]   # Kênh 2: Ngữ cảnh lát cắt liền sau (Context)
+            
+            # Cấu trúc mảng 3 kênh shape (3, H, W)
+            slice_25d = np.stack([
+                images_normalized[idx_prev],  # Kênh 0: t-1
+                images_normalized[k],         # Kênh 1: t (Lát cắt đích)
+                images_normalized[idx_next]   # Kênh 2: t+1
             ], axis=0)
             
-            volume_25d.append(stack)
+            volume_25d.append(slice_25d)
 
-        return volume_25d, hu_volume
+        return np.array(volume_25d, dtype=np.float32), hu_volume

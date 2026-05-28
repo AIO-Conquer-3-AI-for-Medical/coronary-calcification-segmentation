@@ -4,7 +4,6 @@ import sys
 import shutil
 from pathlib import Path
 
-# Add project root path to sys.path to avoid ModuleNotFoundError
 root_path = Path(__file__).resolve().parent.parent
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
@@ -12,235 +11,330 @@ if str(root_path) not in sys.path:
 import streamlit as st
 import torch
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import pydicom
-import os
-import sys
-import shutil
-from pathlib import Path
-from streamlit.runtime.scriptrunner import get_script_run_ctx
+import cv2
 
-# Import core processing logic
 from src.pre_processing import extract_zip_dicom
 from src.data_processing import COCATransformer
 from models.model import UNetModel
+from src.agatston_score import calculate_agatston_score, xml_plist_to_mask_volume, get_scoring_mask
 
-# Import clinical Agatston scoring module
-from src.agatston_score import calculate_agatston_for_volume
-
-# Define temporary storage and model weight paths
-TEMP_STORAGE_DIR = root_path / "app" / "temp_storage"
 WEIGHT_PATH = root_path / "models" / "weights" / "best_model.pt"
-
 BASE_TEMP_DIR = root_path / "app" / "temp_storage"
 BASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Đảm bảo thư mục temp_storage luôn tồn tại trên server khi deploy
-TEMP_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-
-ctx = get_script_run_ctx()
-session_id = ctx.session_id if ctx else "default_session"
-USER_TEMP_DIR = BASE_TEMP_DIR / session_id
-
-# Initialize U-Net Model
+# Hậu xử lý khởi động: Xóa sạch các thư mục rác tồn đọng từ các lần chạy app trước đó
 @st.cache_resource
-def init_model(weight_file):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNetModel(in_channels=3, out_channels=1, base_channels=16)
-    if weight_file.exists():
-        model.load_state_dict(torch.load(str(weight_file), map_location=device))
-        model.to(device)
-        model.eval()
-        return model, device, True
-    return model, device, False
+def clean_all_legacy_temp_storage():
+    if BASE_TEMP_DIR.exists():
+        import shutil
+        shutil.rmtree(BASE_TEMP_DIR, ignore_errors=True)
+    BASE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-model, device, is_loaded = init_model(WEIGHT_PATH)
-transformer = COCATransformer()
+# Chạy hàm dọn dẹp hệ thống một lần duy nhất khi khởi động ứng dụng
+clean_all_legacy_temp_storage()
 
-# Configure Streamlit Page Layout
-st.set_page_config(page_title="Coronary Artery Calcification AI System", layout="wide")
+# Initialize independent session storage to prevent cross-session IO conflicts
+if "session_id" not in st.session_state:
+    import uuid
+    st.session_state["session_id"] = str(uuid.uuid4())
+USER_TEMP_DIR = BASE_TEMP_DIR / st.session_state["session_id"]
 
-st.title("🫀 Coronary Artery Calcification Segmentation & Automated Agatston Scoring")
-st.markdown("---")
+# Initialize analysis execution state
+if "run_analysis" not in st.session_state:
+    st.session_state["run_analysis"] = False
 
-# Sidebar Configuration
-with st.sidebar:
-    st.header("📂 Data Upload")
-    uploaded_file = st.file_uploader("Select Patient Zip containing DICOM series (.zip)", type=["zip"])
-    
-    if not is_loaded:
-        st.error("⚠️ 'best_model.pt' weights not found! Running in structural simulation mode.")
+st.set_page_config(layout="wide", page_title="End-to-End Coronary Artery Calcium Quantification System")
+st.title("🫀 Automated Coronary Artery Calcium Segmentation & Agatston Scoring")
+
+# --- SIDEBAR CONFIGURATION & UPLOAD LAYER ---
+st.sidebar.header("⚙️ System Configuration")
+score_threshold = st.sidebar.slider("AI Binary Segmentation Threshold", 0.1, 0.9, 0.60, 0.05)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+st.sidebar.info(f"💻 Active Compute Device: **{device.upper()}**")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📥 Patient Data Ingestion")
+uploaded_zip = st.sidebar.file_uploader("1. Upload DICOM Series ZIP File:", type=["zip"])
+uploaded_xml = st.sidebar.file_uploader("2. Upload Expert Ground Truth XML (Optional):", type=["xml"])
+
+st.sidebar.markdown("---")
+# Trigger analysis execution upon button press
+if st.sidebar.button("🚀 Run AI Analysis", use_container_width=True):
+    if uploaded_zip is not None:
+        # 🛡️ FIX [Errno 39]: Force-wipes any remnant folders from previous runs in this session
+        if USER_TEMP_DIR.exists():
+            shutil.rmtree(USER_TEMP_DIR, ignore_errors=True)
+        USER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        
+        st.session_state["run_analysis"] = True
     else:
-#        st.success(f"⚡ : {str(device).upper()}")
-        st.success(f"⚡ Model loaded successfully on {str(device).upper()}")
+        st.sidebar.error("❌ Please upload a valid DICOM ZIP file first!")
 
-# --- STATE MANAGEMENT ---
-if "current_file_name" not in st.session_state:
-    st.session_state["current_file_name"] = None
+# --- DATA PROCESSING & INFERENCE ENGINE ---
+hu_volume = None
+images_25d_stack = None
+sorted_slices = None
+pixel_spacing = [0.5, 0.5]
 
-if "current_file_name" not in st.session_state:
-    st.session_state["current_file_name"] = None
+# Load Segmentation Model (Cached Resource Pattern)
+@st.cache_resource
+def load_segmentation_model(weight_path, target_device):
+    model = UNetModel(in_channels=3, out_channels=1)
+    if os.path.exists(weight_path):
+        model.load_state_dict(torch.load(weight_path, map_location=target_device))
+    model.to(target_device)
+    return model
 
-if uploaded_file is not None and st.session_state["current_file_name"] != uploaded_file.name:
-    st.session_state["processed"] = False
-    st.session_state["current_file_name"] = uploaded_file.name
-    # Khi đổi sang file bệnh nhân mới, tiến hành xóa sạch kho lưu trữ cũ của chính phiên đó
-    if USER_TEMP_DIR.exists():
-        shutil.rmtree(USER_TEMP_DIR)
-        
-elif uploaded_file is None:
-    st.session_state["processed"] = False
-    st.session_state["current_file_name"] = None
-    if USER_TEMP_DIR.exists():
-        shutil.rmtree(USER_TEMP_DIR)    
+model = load_segmentation_model(WEIGHT_PATH, device)
 
-if uploaded_file is not None and st.session_state["current_file_name"] != uploaded_file.name:
-    st.session_state["processed"] = False
-    st.session_state["current_file_name"] = uploaded_file.name
-elif uploaded_file is None:
-    st.session_state["processed"] = False
-    st.session_state["current_file_name"] = None
-
-# Main Pipeline Execution
-if uploaded_file is not None and not st.session_state.get('processed', False):
-    if st.sidebar.button("Run AI Diagnostics Pipeline", type="primary"):
-        with st.spinner("Extracting DICOMs, preprocessing volume, and running neural network inference..."):
+# Execute pipeline only if zip is uploaded and analysis state is active
+if uploaded_zip is not None and st.session_state["run_analysis"]:
+    with st.spinner("⏳ Extracting and pre-processing CT volume data..."):
+        try:
+            # 1. Extract raw DICOM series into sandbox temp directory
+            dicom_extracted_path = extract_zip_dicom(uploaded_zip, USER_TEMP_DIR)
             
-            # Extract ZIP file
-            extract_dir = extract_zip_dicom(uploaded_file, str(TEMP_STORAGE_DIR))
+            # 2. Parse metadata and geometrically align slices along the anatomical Z-axis
+            transformer = COCATransformer()
+            sorted_slices, pixel_spacing = transformer.load_and_sort_dicom_folder(dicom_extracted_path)
             
-            # Load and sort DICOM folder by Z-axis geometry
-            dicom_files, pixel_spacing = transformer.load_and_sort_dicom_folder(str(extract_dir))
+            # 3. Reconstruct Hounsfield Unit (HU) volume and construct sliding 2.5D multi-channel stacks
+            images_25d_stack, raw_hu_volume = transformer.transform_patient_volume(sorted_slices)
             
-            if len(dicom_files) == 0:
-                st.error("Error: No valid .dcm slices found in the uploaded zip file.")
-                st.stop()
+            # Array integrity enforcement: Squeeze dimensions to strict 2D matrices (Height, Width)
+            standardized_hu = []
+            for slice_img in raw_hu_volume:
+                if isinstance(slice_img, torch.Tensor):
+                    slice_img = slice_img.cpu().numpy()
+                slice_flat = np.squeeze(slice_img)
+                if slice_flat.shape != (512, 512):
+                    slice_flat = cv2.resize(slice_flat, (512, 512), interpolation=cv2.INTER_LINEAR)
+                standardized_hu.append(slice_flat)
+            hu_volume = np.stack(standardized_hu, axis=0).astype(np.float32)
+            
+            st.success(f"✅ Successfully loaded {len(sorted_slices)} DICOM slices. Pixel Spacing: {pixel_spacing[0]:.3f} x {pixel_spacing[1]:.3f} mm².")
+        except Exception as e:
+            st.error(f"❌ Error processing DICOM image series: {str(e)}")
+            st.stop()
+
+    if hu_volume is not None and images_25d_stack is not None:
+        # --- MODEL INFERENCE ---
+        with st.spinner("🤖 Deep Learning model executing coronary calcification segmentation..."):
+            try:
+                raw_pred_volume, _ = model.predict_volume(images_25d_stack, hu_volume, device, threshold=score_threshold)
                 
-            # Process volume using 2.5D anatomical stacking
-            images_25d_list, hu_volume_list = transformer.prepare_25d_volume(dicom_files)
-            
-            # Cast to NumPy arrays for compatibility with model inference
-            images_25d = np.array(images_25d_list, dtype=np.float32)
-            hu_volume = np.array(hu_volume_list, dtype=np.float32)
-            
-            # Model prediction
-            pred_mask_volume, raw_hu_volume = model.predict_volume(images_25d, hu_volume, device)
-            
-            # Calculate Agatston Score and Cardiovascular Risk Category
-            total_score, risk_label, risk_color, df_slices = calculate_agatston_for_volume(
-                pred_mask_volume, raw_hu_volume, pixel_spacing
-            )
-            
-            # Cache results in Session State
-            st.session_state['pred_mask_volume'] = pred_mask_volume
-            st.session_state['hu_volume'] = raw_hu_volume
-            st.session_state['total_score'] = total_score
-            st.session_state['risk_label'] = risk_label
-            st.session_state['risk_color'] = risk_color
-            st.session_state['df_slices'] = df_slices
-            st.session_state['processed'] = True
-            
-            st.rerun()
+                # Standardize prediction masks geometry
+                standardized_preds = []
+                for mask in raw_pred_volume:
+                    if isinstance(mask, torch.Tensor):
+                        mask = mask.cpu().numpy()
+                    mask_flat = np.squeeze(mask)
+                    if mask_flat.shape != (512, 512):
+                        mask_flat = cv2.resize(mask_flat, (512, 512), interpolation=cv2.INTER_NEAREST)
+                    standardized_preds.append(mask_flat)
+                pred_mask_volume = np.stack(standardized_preds, axis=0).astype(np.uint8)
+            except Exception as e:
+                st.error(f"❌ Inference processing error: {str(e)}")
+                st.stop()
 
-# --- DIAGNOSTIC OUTPUT DISPLAY ---
-if st.session_state.get('processed', False):
-    
-    # Section 1: Quantitative Clinical Metrics Summary
-    st.header("📊 Coronary Artery Calcium (CAC) Summary")
-    card_col1, card_col2 = st.columns(2)
-    
-    with card_col1:
-        st.metric(label="Total Coronary Artery Calcium (Agatston Score)", value=f"{st.session_state['total_score']:.2f}")
-        
-    with card_col2:
-        st.markdown("**Cardiovascular Event Risk Stratification:**")
-        st.markdown(
-            f"<h3 style='color:{st.session_state['risk_color']}; margin-top:0px; font-weight:bold;'>"
-            f"{st.session_state['risk_label']}</h3>", 
-            unsafe_allow_html=True
-        )
-        
-    st.markdown("---")
-    
-    # Section 2: Dual Column Layout (Visualization vs. Per-Slice Statistics)
-    layout_col1, layout_col2 = st.columns([5, 3])
-    
-    pred_mask_volume = st.session_state['pred_mask_volume']
-    hu_volume = st.session_state['hu_volume']
-    num_slices = pred_mask_volume.shape[0]
-    df_slices = st.session_state['df_slices']
+        # --- GROUND TRUTH SYNC & MASK GENERATION ---
+        gt_mask_volume = np.zeros_like(hu_volume, dtype=np.uint8)
+        gt_available = False
 
-    with layout_col2:
-        st.subheader("📋 Calcium Distribution Per Slice")
+        if uploaded_xml is not None:
+            with st.spinner("📑 Parsing expert annotations and executing semantic Z-matching..."):
+                try:
+                    temp_xml_path = USER_TEMP_DIR / uploaded_xml.name
+                    with open(temp_xml_path, "wb") as f:
+                        f.write(uploaded_xml.getbuffer())
+                    
+                    raw_gt_volume = xml_plist_to_mask_volume(str(temp_xml_path), sorted_slices, hu_volume)
+                    
+                    # Standardize ground truth masks geometry
+                    standardized_gt = []
+                    for gt_slice in raw_gt_volume:
+                        if isinstance(gt_slice, torch.Tensor):
+                            gt_slice = gt_slice.cpu().numpy()
+                        gt_flat = np.squeeze(gt_slice)
+                        if gt_flat.shape != (512, 512):
+                            gt_flat = cv2.resize(gt_flat, (512, 512), interpolation=cv2.INTER_NEAREST)
+                        standardized_gt.append(gt_flat)
+                    gt_mask_volume = np.stack(standardized_gt, axis=0).astype(np.uint8)
+                    
+                    if np.any(gt_mask_volume > 0):
+                        gt_available = True
+                        st.success("🎯 Semantic Z-matching aligned Expert Ground Truth annotations successfully!")
+                    else:
+                        st.warning("⚠️ Valid XML loaded, but no Region of Interest (ROI) polygons matched the Z-axis slice range.")
+                except Exception as e:
+                    st.error(f"❌ XML parsing or matching error: {str(e)}")
+
+        # --- CLINICAL QUANTIFICATION (AGATSTON SCORING) ---
+        ai_score, ai_details_df = calculate_agatston_score(pred_mask_volume, hu_volume, pixel_spacing)
         
-        if not df_slices.empty:
-            # Rename columns to English for the UI
-            df_slices_en = df_slices.rename(columns={
-                "Slice Index": "Slice Index",
-                "Agatston Score": "Agatston Score"
-            })
+        if gt_available:
+            gt_score, gt_details_df = calculate_agatston_score(gt_mask_volume, hu_volume, pixel_spacing)
             
-            st.markdown("*💡 Click on a row in the table below to jump directly to that specific slice:*")
-            
-            # FIXED: Changed selection_mode from "single" to "single-row" to prevent StreamlitAPIException
-            selected_row = st.dataframe(
-                df_slices_en, 
-                use_container_width=True, 
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row"
-            )
-            
-            # Determine default index based on user click interaction
-            default_slice_idx = int(num_slices / 2)
-            if selected_row and len(selected_row.get("selection", {}).get("rows", [])) > 0:
-                clicked_row_idx = selected_row["selection"]["rows"][0]
-                default_slice_idx = int(df_slices_en.iloc[clicked_row_idx]["Slice Index"])
+            # Metrics Dashboard Panel
+            m_col1, m_col2, m_col3 = st.columns(3)
+            m_col1.metric(label="Total Agatston Score (AI Model)", value=f"{ai_score:.2f}")
+            m_col2.metric(label="Total Agatston Score (Expert GT)", value=f"{gt_score:.2f}")
+            m_col3.metric(label="Absolute Deviation (MAE)", value=f"{abs(ai_score - gt_score):.2f}")
         else:
-            st.info("No clinically significant calcification detected on any slice.")
-            default_slice_idx = int(num_slices / 2)
+            st.metric(label="Total Agatston Score (AI Model)", value=f"{ai_score:.2f}")
+
+        # --- CALCIFIED SLICES ANALYSIS VISUALIZER ---
+        st.markdown("---")
+        st.header("🔍 Calcified Slice-by-Slice Comparative Visualization")
+
+        ai_slices = set(ai_details_df["slice_idx"].unique()) if not ai_details_df.empty else set()
+        gt_slices = set(gt_details_df["slice_idx"].unique()) if (gt_available and not gt_details_df.empty) else set()
+        calcified_slices = sorted(list(ai_slices.union(gt_slices)))
+
+        if not calcified_slices:
+            st.info("🎈 Excellent! No coronary artery calcification lesions detected across the entire volume by either AI or XML annotations.")
+        else:
+            st.write(f"Detected a total of **{len(calcified_slices)}** slices containing valid calcification plaques.")
+
+            # 3-COLUMN TABLE: SLICE ID, AGATSTON AI, AGATSTON GT
+            table_data = []
+            for idx in calcified_slices:
+                s_ai_score = 0.0
+                s_gt_score = 0.0
+                if not ai_details_df.empty and idx in ai_details_df["slice_idx"].values:
+                    s_ai_score = ai_details_df[ai_details_df["slice_idx"] == idx]["agatston_score"].values[0]
+                if gt_available and not gt_details_df.empty and idx in gt_details_df["slice_idx"].values:
+                    s_gt_score = gt_details_df[gt_details_df["slice_idx"] == idx]["agatston_score"].values[0]
+                table_data.append({
+                    "Slice ID": int(idx),
+                    "Agatston Score (AI)": f"{s_ai_score:.2f}",
+                    "Agatston Score (Expert GT)": f"{s_gt_score:.2f}" if gt_available else "N/A"
+                })
             
-    with layout_col1:
-        st.subheader("🖼️ Segmentation Mask Visualization")
-        
-        # The slider can scan ALL slices, but its position updates automatically if a row is selected above
-        slice_idx = st.slider(
-            "Select Axial CT Slice Index (Allows scanning full volume)", 
-            0, num_slices - 1, default_slice_idx
-        )
-        
-        current_mask = pred_mask_volume[slice_idx]
-        current_hu = hu_volume[slice_idx]
-        
-        # Soft tissue / Bone windowing [-160, 240]
-        windowed_view = np.clip(current_hu, -160, 240)
-        
-        # Generate Matplotlib plots with English descriptions
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6), facecolor='white')
-        
-        # Frame 1: Original CT Scan
-        axes[0].imshow(windowed_view, cmap='gray')
-        axes[0].set_title(f"Original CT (Slice {slice_idx})", fontsize=12, fontweight='bold')
-        axes[0].axis('off')
-        
-        # Frame 2: AI Predicted Binary Mask
-        axes[1].imshow(current_mask, cmap='gray')
-        axes[1].set_title("AI Predicted Mask", fontsize=12, fontweight='bold')
-        axes[1].axis('off')
-        
-        # Frame 3: Red Overlay & Neon Green Boundary Lines
-        axes[2].imshow(windowed_view, cmap='gray')
-        
-        color_mask = np.zeros((current_mask.shape[0], current_mask.shape[1], 3), dtype=np.uint8)
-        color_mask[current_mask == 1] = [255, 0, 0]  # Pure Red for calcified lesions
-        
-        alpha_mask = np.where(current_mask == 1, 0.70, 0.0)
-        axes[2].imshow(color_mask, alpha=alpha_mask)
-        
-        if np.any(current_mask == 1):
-            axes[2].contour(current_mask, colors='#00FF00', levels=[0.5], linewidths=1.5)
+            st.markdown("#### 🗂️ Slice-Level Quantification Summary Table")
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # SLICE SELECTION NAVIGATOR
+            st.markdown("#### 🎚️ Select Target Slice for Detailed Examination")
+            selected_slice = st.slider(
+                "Navigate through slices:",
+                min_value=0,
+                max_value=len(hu_volume) - 1,
+                value=int(min(calcified_slices)) if calcified_slices else 0,
+                step=1
+            )
+
+            # Extract data matrices for the selected slice
+            img_slice = hu_volume[selected_slice]
+            mask_ai = pred_mask_volume[selected_slice]
+            mask_gt = gt_mask_volume[selected_slice] if gt_available else None
+
+            # Apply windowing to optimize contrast for coronary artery visualization
+            vmin, vmax = -200, 600
+            img_clipped = np.clip(img_slice, vmin, vmax)
+
+            # Metrics for current slice
+            ai_info = ai_details_df[ai_details_df["slice_idx"] == selected_slice]
+            gt_info = gt_details_df[gt_details_df["slice_idx"] == selected_slice] if gt_available else pd.DataFrame()
+
+            info_col1, info_col2 = st.columns(2)
+            with info_col1:
+                st.subheader(f"📊 Quantitative Metrics (Slice {selected_slice})")
+                metrics_data = {
+                    "Evaluation Metric": ["Agatston Score", "Peak Density (Max HU)"],
+                    "AI Model Prediction": [
+                        f"{ai_info['agatston_score'].values[0]:.2f}" if not ai_info.empty else "0.00",
+                        f"{ai_info['max_hu'].values[0]:.1f} HU" if not ai_info.empty else "N/A"
+                    ]
+                }
+                if gt_available:
+                    metrics_data["Expert Ground Truth"] = [
+                        f"{gt_info['agatston_score'].values[0]:.2f}" if not gt_info.empty else "0.00",
+                        f"{gt_info['max_hu'].values[0]:.1f} HU" if not gt_info.empty else "N/A"
+                    ]
+                st.table(pd.DataFrame(metrics_data))
+
+            with info_col2:
+                st.subheader("💡 Applied Clinical Standards")
+                st.caption("- **Density Cutoff:** Lesions are only quantified if attenuation density hits the clinical calcium threshold: **≥ 130 HU**.")
+                st.caption("- **Spatial Extent:** Connected component clusters must possess an isolated cross-sectional area **≥ 1 mm²** to filter noise artifacts.")
+
+# --- PLOT NATIVE IMAGES AND SEGMENTATION MASKS (MATPLOTLIB OVERLAY) ---
+            img_slice = hu_volume[selected_slice]
+            mask_ai = pred_mask_volume[selected_slice]
+            mask_gt = gt_mask_volume[selected_slice] if gt_available else None
+
+            # Configure windowing (soft tissue/bone) to optimize contrast for coronary CT images
+            vmin, vmax = -200, 600
+            img_clipped = np.clip(img_slice, vmin, vmax)
+
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            fig.patch.set_facecolor('#0e1117') # Match Streamlit dark theme background color
+
+            # Subplot 1: Native coronary CT image
+            axes[0].imshow(img_clipped, cmap="gray", vmin=vmin, vmax=vmax)
+            axes[0].set_title("Native CT Image (HU Windowed)", color="white", fontsize=12)
+            axes[0].axis("off")
+
+            # Subplot 2: AI predicted segmentation mask only
+            mask_ai_colored = np.zeros((mask_ai.shape[0], mask_ai.shape[1], 3))
+            mask_ai_colored[mask_ai > 0] = [1.0, 0.0, 0.0]  # Red
+            axes[1].imshow(mask_ai_colored)
+            axes[1].set_title(f"AI Predicted Segmentation (Slice {selected_slice})", color="orange", fontsize=12)
+            axes[1].axis("off")
+
+            # Subplot 3: Blend AI (red), GT (green), and overlap (yellow) masks overlay on native CT image
+            axes[2].imshow(img_clipped, cmap="gray", vmin=vmin, vmax=vmax)
+            # Create color array for overlay
+            rgba_overlay = np.zeros((mask_ai.shape[0], mask_ai.shape[1], 4))
             
-        axes[2].set_title("Lesion Overlay (Red + Neon Green Border)", fontsize=12, fontweight='bold')
-        axes[2].axis('off')
-        
-        st.pyplot(fig)
+            if gt_available and mask_gt is not None:
+                # AI-only region (Red)
+                only_ai = (mask_ai > 0) & (mask_gt == 0)
+                rgba_overlay[only_ai] = [1.0, 0.0, 0.0, 0.6]  # Red
+                
+                # GT-only region (Green)
+                only_gt = (mask_ai == 0) & (mask_gt > 0)
+                rgba_overlay[only_gt] = [0.0, 1.0, 0.0, 0.6]  # Green
+                
+                # Overlap region between AI and GT (Yellow)
+                overlap = (mask_ai > 0) & (mask_gt > 0)
+                rgba_overlay[overlap] = [1.0, 1.0, 0.0, 0.8]  # Yellow, Alpha = 0.8
+                
+                axes[2].imshow(rgba_overlay)
+                axes[2].set_title(f"Overlap Masks (Slice {selected_slice}): Red=AI only, Green=GT only, Yellow=Overlap", color="lightblue", fontsize=11)
+            else:
+                # If Ground Truth is unavailable, show AI predicted overlay only
+                rgba_overlay[mask_ai > 0] = [1.0, 0.0, 0.0, 0.6]  # Red
+                axes[2].imshow(rgba_overlay)
+                axes[2].set_title(f"AI Predicted Mask Overlay (Slice {selected_slice})", color="orange", fontsize=12)
+            axes[2].axis("off")
+
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            plt.close(fig)
+            del fig, axes
+
+            # Detailed Logs Viewers
+            st.markdown("#### 📝 Diagnostic Logs Checklist")
+            tab_ai, tab_gt = st.tabs(["AI Model Predicted Lesions", "Expert Ground Truth Lesions (XML)"])
+            with tab_ai:
+                st.dataframe(ai_details_df, use_container_width=True)
+            with tab_gt:
+                if gt_available:
+                    st.dataframe(gt_details_df, use_container_width=True)
+                else:
+                    st.caption("No expert validation XML file uploaded for this case.")
+
+else:
+    # Standby state view
+    st.info("💡 Ready for execution. Please load the patient data in the sidebar and click 'Run AI Analysis'.")
+
+# --- CONTEXT PERSISTENCE MEMORY CLEANUP ---
+if USER_TEMP_DIR.exists() and uploaded_zip is None:
+    shutil.rmtree(USER_TEMP_DIR)
