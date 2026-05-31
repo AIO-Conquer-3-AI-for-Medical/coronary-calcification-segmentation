@@ -16,3 +16,8 @@
 
 /dataprep/data_processing.py
 /dataprep/pre_processing.py
+
+__pycache__/
+*.pyc
+app/temp_storage/
+*.dcm

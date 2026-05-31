@@ -3,8 +3,6 @@ Test loss: 0.43
 Test metrics:
 dice: 0.9357
 iou: 0.9305
-precision: 0.1405
-recall: 0.1421
 global_precision: 0.8622
 global_recall: 0.9278
 Test positive/negative-separated metrics:
